@@ -1,0 +1,13 @@
+# Binaries
+SecretMe
+main
+*.exe
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
