@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: secretme
+      POSTGRES_PASSWORD: secretme
+      POSTGRES_DB: secretme
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secretme"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
+      DATABASE_URL: postgres://secretme:secretme@db:5432/secretme?sslmode=disable
+    restart: unless-stopped
+
+volumes:
+  pgdata:
