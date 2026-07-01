@@ -398,9 +398,9 @@ func (h *Handler) handleCallbackQuery(ctx *telegohandler.Context, update telego.
 		(msg.RecipientUsername == "" && callback.From.ID == msg.RecipientID)
 
 	if isRecipient {
-		readByDisplay := callback.From.Username
+		readByDisplay := callback.From.FirstName
 		if readByDisplay == "" {
-			readByDisplay = callback.From.FirstName
+			readByDisplay = callback.From.Username
 		}
 
 		loc, err := time.LoadLocation("America/Sao_Paulo")
@@ -680,9 +680,9 @@ func (h *Handler) deliverSecret(ctx context.Context, msg *telego.Message, token 
 		(secret.RecipientUsername == "" && msg.From.ID == secret.RecipientID)
 
 	if isRecipient && secret.InlineMessageID != "" {
-		readByDisplay := msg.From.Username
+		readByDisplay := msg.From.FirstName
 		if readByDisplay == "" {
-			readByDisplay = msg.From.FirstName
+			readByDisplay = msg.From.Username
 		}
 		loc, _ := time.LoadLocation("America/Sao_Paulo")
 		if loc == nil {
