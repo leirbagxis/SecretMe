@@ -100,8 +100,8 @@ func (h *Handler) captureUsers(ctx *telegohandler.Context, update telego.Update)
 }
 
 // handleInlineQuery processes inline queries in the format:
-//   @bot @recipient message                     → text secret (callback + alert)
-//   @bot MEDIA_TOKEN @recipient message          → media secret (deep link → PV)
+//   @bot @recipient message                     → text secret (callback → alert in group)
+//   @bot MEDIA_TOKEN @recipient message          → media secret (callback → redirect → PV)
 func (h *Handler) handleInlineQuery(ctx *telegohandler.Context, update telego.Update) error {
 	inline := update.InlineQuery
 	query := strings.TrimSpace(inline.Query)
@@ -253,45 +253,25 @@ func (h *Handler) handleInlineQuery(ctx *telegohandler.Context, update telego.Up
 		)
 	}
 
+	// Always use callback button. For media or long text, the callback handler
+	// redirects the user to PV via AnswerCallbackQuery WithURL.
 	buttonText := "🔒 Abrir Mensagem Secreta"
-
-	if fileType != "" || utf8.RuneCountInString(messageText) > 200 {
-		// Long text or media: button with deep link URL → opens PV for delivery
-		deepLink := fmt.Sprintf("https://t.me/%s?start=s_%s", h.botUsername, token)
-		result := tu.ResultArticle(
-			token,
-			title,
-			tu.TextMessage(inputText).WithParseMode("HTML"),
-		).WithDescription(description).
-			WithReplyMarkup(
-				tu.InlineKeyboard(
-					tu.InlineKeyboardRow(
-						tu.InlineKeyboardButton(buttonText).WithURL(deepLink),
-					),
+	callbackData := fmt.Sprintf("secret:%s", token)
+	result := tu.ResultArticle(
+		token,
+		title,
+		tu.TextMessage(inputText).WithParseMode("HTML"),
+	).WithDescription(description).
+		WithReplyMarkup(
+			tu.InlineKeyboard(
+				tu.InlineKeyboardRow(
+					tu.InlineKeyboardButton(buttonText).WithCallbackData(callbackData),
 				),
-			)
-		log.Printf("[INLINE] Answering with URL deep link result")
-		err = h.bot.AnswerInlineQuery(ctx,
-			tu.InlineQuery(inline.ID, result).WithIsPersonal().WithCacheTime(0))
-	} else {
-		// Short text: button with callback data → alert in group
-		callbackData := fmt.Sprintf("secret:%s", token)
-		result := tu.ResultArticle(
-			token,
-			title,
-			tu.TextMessage(inputText).WithParseMode("HTML"),
-		).WithDescription(description).
-			WithReplyMarkup(
-				tu.InlineKeyboard(
-					tu.InlineKeyboardRow(
-						tu.InlineKeyboardButton(buttonText).WithCallbackData(callbackData),
-					),
-				),
-			)
-		log.Printf("[INLINE] Answering with callback result")
-		err = h.bot.AnswerInlineQuery(ctx,
-			tu.InlineQuery(inline.ID, result).WithIsPersonal().WithCacheTime(0))
-	}
+			),
+		)
+	log.Printf("[INLINE] Answering with callback result")
+	err = h.bot.AnswerInlineQuery(ctx,
+		tu.InlineQuery(inline.ID, result).WithIsPersonal().WithCacheTime(0))
 
 	if err != nil {
 		log.Printf("[INLINE] AnswerInlineQuery error: %v", err)
@@ -370,19 +350,43 @@ func (h *Handler) handleCallbackQuery(ctx *telegohandler.Context, update telego.
 
 	// Answer callback
 	plainStr := string(plaintext)
-	if utf8.RuneCountInString(plainStr) <= 200 {
-		// Short message: show directly in alert
+
+	var notificationText string
+	needsRedirect := false
+
+	if msg.FileType != "" {
+		// Media message: redirect to PV for delivery
+		needsRedirect = true
+		switch msg.FileType {
+		case "photo":
+			notificationText = "📷 Mensagem com foto! Abrindo no privado..."
+		case "video":
+			notificationText = "🎬 Mensagem com vídeo! Abrindo no privado..."
+		case "audio":
+			notificationText = "🎵 Mensagem com áudio! Abrindo no privado..."
+		case "document":
+			notificationText = "📎 Mensagem com documento! Abrindo no privado..."
+		default:
+			notificationText = "📎 Mensagem com mídia! Abrindo no privado..."
+		}
+	} else if utf8.RuneCountInString(plainStr) > 200 {
+		// Long text: redirect to PV
+		needsRedirect = true
+		notificationText = "📝 Mensagem muito longa! Veja no privado do bot."
+	}
+
+	if needsRedirect {
+		log.Printf("[CALLBACK] Redirecting to PV: %s", notificationText)
+		deepLink := fmt.Sprintf("https://t.me/%s?start=s_%s", h.botUsername, token)
+		err = h.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(callback.ID).
+			WithText(notificationText).
+			WithURL(deepLink))
+	} else {
+		// Short text: show directly in alert
 		log.Printf("[CALLBACK] Answering with alert")
 		err = h.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(callback.ID).
 			WithText(plainStr).
 			WithShowAlert())
-	} else {
-		// Long message: redirect to PV via deep link URL
-		log.Printf("[CALLBACK] Message too long, redirecting to PV")
-		deepLink := fmt.Sprintf("https://t.me/%s?start=s_%s", h.botUsername, token)
-		err = h.bot.AnswerCallbackQuery(ctx, tu.CallbackQuery(callback.ID).
-			WithText("📝 Mensagem muito longa! Veja no privado do bot.").
-			WithURL(deepLink))
 	}
 	if err != nil {
 		log.Printf("[CALLBACK] Error answering callback: %v", err)
@@ -611,6 +615,14 @@ func (h *Handler) deliverSecret(ctx context.Context, msg *telego.Message, token 
 		),
 	)
 
+	// Build group reply keyboard for the read receipt edit (same layout as callback handler)
+	groupReplyQuery := fmt.Sprintf("%d ", secret.SenderID)
+	groupReplyKeyboard := tu.InlineKeyboard(
+		tu.InlineKeyboardRow(
+			tu.InlineKeyboardButton("💬 Responder").WithSwitchInlineQueryCurrentChat(groupReplyQuery),
+		),
+	)
+
 	if secret.FileType == "photo" && secret.FileID != "" {
 		log.Printf("[DELIVER] Sending photo (spoiler)")
 		_, err = h.bot.SendPhoto(ctx, &telego.SendPhotoParams{
@@ -683,6 +695,7 @@ func (h *Handler) deliverSecret(ctx context.Context, msg *telego.Message, token 
 			InlineMessageID: secret.InlineMessageID,
 			Text:            editText,
 			ParseMode:       "HTML",
+			ReplyMarkup:     groupReplyKeyboard,
 		})
 		if err != nil {
 			log.Printf("[DELIVER] Error editing inline message (non-fatal): %v", err)
