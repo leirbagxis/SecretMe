@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	_ "time/tzdata" // embed IANA timezone database so LoadLocation works everywhere
 
 	"github.com/mymmrac/telego"
 	th "github.com/mymmrac/telego/telegohandler"

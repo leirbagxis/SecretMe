@@ -21,6 +21,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
       DATABASE_URL: postgres://secretme:secretme@db:5432/secretme?sslmode=disable
+      TZ: America/Sao_Paulo
     restart: unless-stopped
 
 volumes:
