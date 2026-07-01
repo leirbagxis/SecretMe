@@ -72,25 +72,26 @@ func (h *Handler) captureUsers(ctx *telegohandler.Context, update telego.Update)
 	log.Printf("[MIDDLEWARE] Processing update")
 
 	type userInfo struct {
-		Username string
-		ID       int64
+		Username  string
+		ID        int64
+		FirstName string
 	}
 
 	var users []userInfo
 
 	if update.Message != nil && update.Message.From != nil {
-		users = append(users, userInfo{Username: update.Message.From.Username, ID: update.Message.From.ID})
+		users = append(users, userInfo{Username: update.Message.From.Username, ID: update.Message.From.ID, FirstName: update.Message.From.FirstName})
 	}
 	if update.InlineQuery != nil {
-		users = append(users, userInfo{Username: update.InlineQuery.From.Username, ID: update.InlineQuery.From.ID})
+		users = append(users, userInfo{Username: update.InlineQuery.From.Username, ID: update.InlineQuery.From.ID, FirstName: update.InlineQuery.From.FirstName})
 	}
 	if update.CallbackQuery != nil {
-		users = append(users, userInfo{Username: update.CallbackQuery.From.Username, ID: update.CallbackQuery.From.ID})
+		users = append(users, userInfo{Username: update.CallbackQuery.From.Username, ID: update.CallbackQuery.From.ID, FirstName: update.CallbackQuery.From.FirstName})
 	}
 
 	for _, u := range users {
 		if u.Username != "" {
-			if err := h.store.SaveUsername(context.Background(), u.Username, u.ID); err != nil {
+			if err := h.store.SaveUsername(context.Background(), u.Username, u.ID, u.FirstName); err != nil {
 				log.Printf("[MIDDLEWARE] Error caching username: %v", err)
 			}
 		}
@@ -123,37 +124,47 @@ func (h *Handler) handleInlineQuery(ctx *telegohandler.Context, update telego.Up
 	first := parts[0]
 	rest := parts[1]
 
-	// Check if first part is a media token (8 hex chars, not starting with @, not numeric)
+	// Check if first part is a media token (8 hex chars, not starting with @).
+	// We check the DB FIRST before trying to parse as a numeric recipient,
+	// so hex tokens that happen to be all digits (e.g. "12345678") work correctly.
 	var fileID, fileType string
 	if !strings.HasPrefix(first, "@") {
-		if _, err := strconv.ParseInt(first, 10, 64); err != nil {
-			// Not a numeric ID and not @ — try as media token
-			media, err := h.store.GetMediaByToken(ctx, first)
-			if err == nil && media.SenderID == inline.From.ID {
-				// Valid media token
-				fileID = media.FileID
-				fileType = media.FileType
-				log.Printf("[INLINE] Media token accepted: type=%s", fileType)
-				// Delete the media token after use (one-time use)
-				_ = h.store.DeleteMedia(ctx, first)
-				// Parse recipient and optional message from rest
-				parts = strings.SplitN(rest, " ", 2)
-				if len(parts) < 1 || parts[0] == "" {
-					log.Printf("[INLINE] Media token but no recipient")
-					return nil
-				}
-				first = parts[0]
-				rest = ""
-				if len(parts) >= 2 {
-					rest = parts[1]
-				}
-			} else if err != nil {
-				log.Printf("[INLINE] Media token rejected: not found")
-				return nil
-			} else {
+		// ── Try as media token first ──
+		media, mediaErr := h.store.GetMediaByToken(ctx, first)
+		if mediaErr == nil {
+			// Valid media token found in DB
+			if media.SenderID != inline.From.ID {
 				log.Printf("[INLINE] Media token rejected: wrong owner")
 				return nil
 			}
+			fileID = media.FileID
+			fileType = media.FileType
+			log.Printf("[INLINE] Media token accepted: type=%s", fileType)
+			// Delete the media token after use (one-time use)
+			_ = h.store.DeleteMedia(ctx, first)
+
+			// Parse recipient and optional message from rest
+			parts = strings.SplitN(rest, " ", 2)
+			if len(parts) < 1 || parts[0] == "" {
+				log.Printf("[INLINE] Media token but no recipient")
+				return nil
+			}
+			first = parts[0]
+			if len(parts) >= 2 && parts[1] != "" {
+				// User provided text in inline query — use it
+				rest = parts[1]
+			} else {
+				// No inline text — use the saved caption from the media upload (if any)
+				rest = media.Caption
+			}
+		} else {
+			// Not a media token — must be a numeric recipient ID
+			if _, err := strconv.ParseInt(first, 10, 64); err != nil {
+				log.Printf("[INLINE] Invalid first token: not a media token and not a numeric ID")
+				return nil
+			}
+			// It's a numeric ID, continue (fileID/fileType remain empty)
+			log.Printf("[INLINE] First token is a numeric recipient ID")
 		}
 	}
 
@@ -213,21 +224,29 @@ func (h *Handler) handleInlineQuery(ctx *telegohandler.Context, update telego.Up
 	}
 	log.Printf("[INLINE] Message saved")
 
-	// Build recipient label for display (title is plain text)
-	// We prefer @username; fall back to a generic label.
+	// Build recipient label for display (title is plain text).
+	// We prefer the cached first name; fall back to @username or "usuário".
 	var recipientLabel string
 	var recipientLinkID int64 // for HTML profile link in message content
 
 	if recipientUsername != "" {
-		recipientLabel = "@" + recipientUsername
-		// Try to look up the user ID for the profile link
+		// Look up user ID and display name for the @username
 		if uid, err := h.store.GetUserIDByUsername(ctx, recipientUsername); err == nil && uid != 0 {
 			recipientLinkID = uid
+			if name, err := h.store.GetUserDisplayName(ctx, uid); err == nil && name != "" {
+				recipientLabel = name
+			} else {
+				recipientLabel = "@" + recipientUsername
+			}
+		} else {
+			recipientLabel = "@" + recipientUsername
 		}
 	} else {
 		recipientLinkID = recipientID
-		// Try to find a cached username for this ID
-		if uname, err := h.store.GetUsernameByUserID(ctx, recipientID); err == nil && uname != "" {
+		// Try cached display name first
+		if name, err := h.store.GetUserDisplayName(ctx, recipientID); err == nil && name != "" {
+			recipientLabel = name
+		} else if uname, err := h.store.GetUsernameByUserID(ctx, recipientID); err == nil && uname != "" {
 			recipientLabel = "@" + uname
 		} else {
 			recipientLabel = "usuário" // generic fallback, profile link still works
@@ -459,7 +478,7 @@ func (h *Handler) handleMessage(ctx *telegohandler.Context, update telego.Update
 			tu.ID(msg.Chat.ID),
 			"👋 Eu sou o bot de mensagens secretas!\n\n"+
 				"📝 Texto: Use @"+h.botUsername+" @destinatario sua mensagem em qualquer grupo.\n"+
-				"📷 Mídia: Envie uma foto/vídeo/áudio aqui no PV, depois use o token no inline.\n"+
+				"📷 Mídia: Envie uma foto/vídeo/áudio aqui no PV (com ou sem legenda), depois use o token no inline.\n"+
 				"🔒 A mensagem só pode ser lida pelo destinatário.",
 		))
 		if err != nil {
@@ -483,10 +502,11 @@ func (h *Handler) handleMessage(ctx *telegohandler.Context, update telego.Update
 }
 
 // handleMediaUpload processes a media file sent to the bot in PV.
-// It stores the file_id and returns a token for use in inline mode.
+// It stores the file_id, file_type, and caption, then returns a token for use in inline mode.
 func (h *Handler) handleMediaUpload(ctx context.Context, msg *telego.Message) error {
 	var fileID, fileType string
 	var typeEmoji string
+	caption := msg.Caption // may be empty
 
 	if len(msg.Photo) > 0 {
 		fileID = msg.Photo[len(msg.Photo)-1].FileID // largest photo
@@ -519,7 +539,7 @@ func (h *Handler) handleMediaUpload(ctx context.Context, msg *telego.Message) er
 		return nil
 	}
 
-	if err := h.store.SaveMedia(ctx, token, fileID, fileType, msg.From.ID); err != nil {
+	if err := h.store.SaveMedia(ctx, token, fileID, fileType, msg.From.ID, caption); err != nil {
 		log.Printf("[UPLOAD] Save error: %v", err)
 		_, _ = h.bot.SendMessage(ctx, tu.Message(
 			tu.ID(msg.Chat.ID), "❌ Erro ao salvar mídia.",
@@ -531,9 +551,13 @@ func (h *Handler) handleMediaUpload(ctx context.Context, msg *telego.Message) er
 		"%s Mídia recebida!\n\n"+
 			"📌 Token: <code>%s</code>\n\n"+
 			"Agora use no inline de qualquer grupo:\n"+
-			"<code>@%s %s @destinatario sua mensagem</code>",
+			"<code>@%s %s @destinatario sua mensagem</code>\n"+
+			"💡 Se você enviou a mídia com legenda, ela será usada como mensagem padrão.",
 		typeEmoji, token, h.botUsername, token,
 	)
+	if caption != "" {
+		response += fmt.Sprintf("\n📝 Legenda salva: \"%s\"", caption)
+	}
 	_, err = h.bot.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), response).
 		WithParseMode("HTML"))
 	if err != nil {

@@ -111,10 +111,25 @@ func NewPostgresStorage(databaseURL string) (*PostgresStorage, error) {
 			file_id TEXT NOT NULL,
 			file_type TEXT NOT NULL,
 			sender_id BIGINT NOT NULL,
+			caption TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ DEFAULT NOW()
 		)`,
 	); err != nil {
 		return nil, fmt.Errorf("create media_uploads table: %w", err)
+	}
+
+	// Add caption column to media_uploads if upgrading from old schema
+	if _, err := conn.Exec(context.Background(),
+		`ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS caption TEXT NOT NULL DEFAULT ''`,
+	); err != nil {
+		return nil, fmt.Errorf("add media_uploads caption column: %w", err)
+	}
+
+	// Add first_name column to username_cache
+	if _, err := conn.Exec(context.Background(),
+		`ALTER TABLE username_cache ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT ''`,
+	); err != nil {
+		return nil, fmt.Errorf("add username_cache first_name column: %w", err)
 	}
 
 	return &PostgresStorage{conn: conn}, nil
@@ -144,14 +159,15 @@ type MediaUpload struct {
 	FileID   string
 	FileType string
 	SenderID int64
+	Caption  string
 }
 
-// SaveMedia stores a media upload with its token.
-func (s *PostgresStorage) SaveMedia(ctx context.Context, token, fileID, fileType string, senderID int64) error {
+// SaveMedia stores a media upload with its token and optional caption.
+func (s *PostgresStorage) SaveMedia(ctx context.Context, token, fileID, fileType string, senderID int64, caption string) error {
 	_, err := s.conn.Exec(ctx,
-		`INSERT INTO media_uploads (token, file_id, file_type, sender_id)
-		 VALUES ($1, $2, $3, $4)`,
-		token, fileID, fileType, senderID,
+		`INSERT INTO media_uploads (token, file_id, file_type, sender_id, caption)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		token, fileID, fileType, senderID, caption,
 	)
 	if err != nil {
 		return fmt.Errorf("save media: %w", err)
@@ -163,9 +179,9 @@ func (s *PostgresStorage) SaveMedia(ctx context.Context, token, fileID, fileType
 func (s *PostgresStorage) GetMediaByToken(ctx context.Context, token string) (*MediaUpload, error) {
 	m := &MediaUpload{}
 	err := s.conn.QueryRow(ctx,
-		`SELECT token, file_id, file_type, sender_id FROM media_uploads WHERE token = $1`,
+		`SELECT token, file_id, file_type, sender_id, caption FROM media_uploads WHERE token = $1`,
 		token,
-	).Scan(&m.Token, &m.FileID, &m.FileType, &m.SenderID)
+	).Scan(&m.Token, &m.FileID, &m.FileType, &m.SenderID, &m.Caption)
 	if err != nil {
 		return nil, fmt.Errorf("get media by token: %w", err)
 	}
@@ -253,17 +269,35 @@ func (s *PostgresStorage) Close() error {
 }
 
 // SaveUsername stores or updates the mapping from a Telegram username to a user ID.
-func (s *PostgresStorage) SaveUsername(ctx context.Context, username string, userID int64) error {
+// firstName is the user's display name (can be empty).
+func (s *PostgresStorage) SaveUsername(ctx context.Context, username string, userID int64, firstName string) error {
 	_, err := s.conn.Exec(ctx,
-		`INSERT INTO username_cache (username, user_id, updated_at)
-		 VALUES ($1, $2, NOW())
-		 ON CONFLICT (username) DO UPDATE SET user_id = $2, updated_at = NOW()`,
-		username, userID,
+		`INSERT INTO username_cache (username, user_id, first_name, updated_at)
+		 VALUES ($1, $2, $3, NOW())
+		 ON CONFLICT (username) DO UPDATE SET user_id = $2, first_name = $3, updated_at = NOW()`,
+		username, userID, firstName,
 	)
 	if err != nil {
 		return fmt.Errorf("save username: %w", err)
 	}
 	return nil
+}
+
+// GetUserDisplayName retrieves the first name of a user by their user ID.
+// Returns ("", nil) if the user ID is not found.
+func (s *PostgresStorage) GetUserDisplayName(ctx context.Context, userID int64) (string, error) {
+	var firstName string
+	err := s.conn.QueryRow(ctx,
+		`SELECT COALESCE(first_name, '') FROM username_cache WHERE user_id = $1`,
+		userID,
+	).Scan(&firstName)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get user display name: %w", err)
+	}
+	return firstName, nil
 }
 
 // GetUserIDByUsername looks up a user ID by their Telegram username (without @).
